@@ -172,7 +172,8 @@ if(BUILD_TESTING)
     test/integration/test_agnocast_single_threaded_executor.cpp
     test/integration/test_agnocast_multi_threaded_executor.cpp
     test/integration/src/ioctl_mock.cpp
-    test/integration/src/node_for_executor_test.cpp)
+    test/integration/src/node_for_executor_test.cpp
+    test/integration/test_agnocast_only_single_threaded_executor.cpp)
   target_include_directories(test_integration_${PROJECT_NAME} PRIVATE test/integration/include)
   target_link_libraries(test_integration_${PROJECT_NAME} agnocast)
   ament_target_dependencies(test_integration_${PROJECT_NAME}
