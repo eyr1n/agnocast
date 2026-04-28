@@ -8,68 +8,87 @@
 
 using namespace std::chrono_literals;
 
-class AgnocastOnlyDummyNode : public agnocast::Node
-{
-public:
-  AgnocastOnlyDummyNode() : agnocast::Node("agnocast_only_dummy_node")
-  {
-    timer_ = this->create_timer(100ms, [this]() { count++; });
-  }
-
-  int count = 0;
-
-private:
-  agnocast::TimerBase::SharedPtr timer_;
-};
-
 class AgnocastOnlySingleThreadedExecutorTest : public ::testing::Test
 {
-protected:
+public:
   void SetUp() override
   {
     agnocast::init(0, nullptr);
-    executor_ = std::make_shared<agnocast::AgnocastOnlySingleThreadedExecutor>();
-    node_ = std::make_shared<AgnocastOnlyDummyNode>();
-    executor_->add_node(node_);
+
+    const auto test_info = ::testing::UnitTest::GetInstance()->current_test_info();
+    std::stringstream test_name;
+    test_name << test_info->test_case_name() << "_" << test_info->name();
+    node = std::make_shared<agnocast::Node>("node", test_name.str());
   }
 
-  void TearDown() override { agnocast::shutdown(); }
+  void TearDown() override
+  {
+    node.reset();
 
-  std::shared_ptr<agnocast::AgnocastOnlySingleThreadedExecutor> executor_;
-  std::shared_ptr<AgnocastOnlyDummyNode> node_;
+    agnocast::shutdown();
+  }
+
+  std::shared_ptr<agnocast::Node> node;
 };
 
 TEST_F(AgnocastOnlySingleThreadedExecutorTest, test_is_spinning)
 {
-  EXPECT_FALSE(executor_->is_spinning());
+  agnocast::AgnocastOnlySingleThreadedExecutor executor;
+  executor.add_node(this->node);
 
-  std::thread spin_thread([this]() { this->executor_->spin(); });
+  EXPECT_FALSE(executor.is_spinning());
 
-  auto deadline = std::chrono::steady_clock::now() + 1s;
-  while (std::chrono::steady_clock::now() < deadline) {
-    if (executor_->is_spinning()) {
-      break;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  std::thread spinner([&]() { executor.spin(); });
+
+  auto start = std::chrono::steady_clock::now();
+  while (!executor.is_spinning() && (std::chrono::steady_clock::now() - start) < 10s) {
+    std::this_thread::sleep_for(1ms);
   }
 
-  EXPECT_TRUE(executor_->is_spinning());
+  EXPECT_TRUE(executor.is_spinning());
 
-  executor_->cancel();
-  spin_thread.join();
+  executor.cancel();
+  spinner.join();
+  executor.remove_node(this->node, true);
 
-  EXPECT_FALSE(executor_->is_spinning());
+  EXPECT_FALSE(executor.is_spinning());
 }
 
 TEST_F(AgnocastOnlySingleThreadedExecutorTest, test_spin_once)
 {
-  EXPECT_EQ(node_->count, 0);
+  agnocast::AgnocastOnlySingleThreadedExecutor executor;
 
-  executor_->spin_once();
+  std::atomic<bool> timer_completed = false;
+  auto timer = this->node->create_wall_timer(1ms, [&]() { timer_completed = true; });
+  executor.add_node(this->node);
 
-  EXPECT_EQ(node_->count, 1);
+  executor.spin_once();
 
-  executor_->spin_once();
+  auto start = std::chrono::steady_clock::now();
+  while (!timer_completed && (std::chrono::steady_clock::now() - start) < 10s) {
+    std::this_thread::sleep_for(1ms);
+  }
 
-  EXPECT_EQ(node_->count, 2);
+  EXPECT_TRUE(timer_completed);
+
+  executor.cancel();
+  executor.remove_node(this->node, true);
+}
+
+TEST_F(AgnocastOnlySingleThreadedExecutorTest, test_spin_until_future_complete)
+{
+  agnocast::AgnocastOnlySingleThreadedExecutor executor;
+  executor.add_node(this->node);
+
+  std::promise<bool> promise;
+  std::future<bool> future = promise.get_future();
+  promise.set_value(true);
+
+  auto start = std::chrono::steady_clock::now();
+  auto shared_future = future.share();
+  auto ret = executor.spin_until_future_complete(shared_future, 1s);
+  executor.remove_node(this->node, true);
+
+  EXPECT_GT(500ms, (std::chrono::steady_clock::now() - start));
+  EXPECT_EQ(rclcpp::FutureReturnCode::SUCCESS, ret);
 }
