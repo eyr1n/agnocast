@@ -40,6 +40,16 @@ std::chrono::steady_clock::duration measure_elapsed_time(Function && function)
   return std::chrono::steady_clock::now() - start;
 }
 
+void expect_node_is_detached(
+  agnocast::AgnocastOnlySingleThreadedExecutor & executor,
+  const std::shared_ptr<agnocast::Node> & node)
+{
+  EXPECT_NO_THROW({
+    executor.add_node(node);
+    executor.remove_node(node, true);
+  });
+}
+
 }  // namespace
 
 class AgnocastOnlySingleThreadedExecutorTest : public ::testing::Test
@@ -809,4 +819,504 @@ TEST_F(AgnocastOnlySingleThreadedExecutorTest, test_spin_all_sets_is_spinning)
 
   executor.cancel();
   executor.remove_node(this->node, true);
+}
+
+TEST_F(AgnocastOnlySingleThreadedExecutorTest, test_spin_node_once)
+{
+  // Arrange
+  agnocast::AgnocastOnlySingleThreadedExecutor executor;
+
+  std::atomic<bool> timer_completed{false};
+  [[maybe_unused]] auto timer =
+    this->node->create_wall_timer(1ms, [&]() { timer_completed.store(true); });
+
+  // Act
+  executor.spin_node_once(this->node);
+
+  // Assert
+  EXPECT_TRUE(wait_until([&]() { return timer_completed.load(); }, 10s));
+  EXPECT_FALSE(executor.is_spinning());
+  expect_node_is_detached(executor, this->node);
+
+  // Cleanup
+  executor.cancel();
+}
+
+TEST_F(
+  AgnocastOnlySingleThreadedExecutorTest, test_spin_node_once_with_no_timeout_blocks_until_cancel)
+{
+  // Arrange
+  agnocast::AgnocastOnlySingleThreadedExecutor executor;
+
+  std::atomic<bool> spin_node_once_returned{false};
+
+  std::thread spinner([&]() {
+    executor.spin_node_once(this->node, std::chrono::nanoseconds(-1));
+    spin_node_once_returned.store(true);
+  });
+
+  EXPECT_TRUE(wait_until([&]() { return executor.is_spinning(); }, 10s));
+  EXPECT_FALSE(spin_node_once_returned.load());
+
+  // Act
+  executor.cancel();
+  spinner.join();
+
+  // Assert
+  EXPECT_TRUE(spin_node_once_returned.load());
+  EXPECT_FALSE(executor.is_spinning());
+  expect_node_is_detached(executor, this->node);
+}
+
+TEST_F(
+  AgnocastOnlySingleThreadedExecutorTest, test_spin_node_once_with_zero_timeout_returns_immediately)
+{
+  // Arrange
+  agnocast::AgnocastOnlySingleThreadedExecutor executor;
+
+  // Act
+  const auto elapsed = measure_elapsed_time([&]() { executor.spin_node_once(this->node, 0ns); });
+
+  // Assert
+  EXPECT_LT(elapsed, 100ms);
+  EXPECT_FALSE(executor.is_spinning());
+  expect_node_is_detached(executor, this->node);
+}
+
+TEST_F(AgnocastOnlySingleThreadedExecutorTest, test_spin_node_once_waits_until_timeout)
+{
+  // Arrange
+  agnocast::AgnocastOnlySingleThreadedExecutor executor;
+
+  // Act
+  const auto elapsed = measure_elapsed_time([&]() { executor.spin_node_once(this->node, 100ms); });
+
+  // Assert
+  EXPECT_GE(elapsed, 90ms);
+  EXPECT_LT(elapsed, 1s);
+  EXPECT_FALSE(executor.is_spinning());
+  expect_node_is_detached(executor, this->node);
+}
+
+TEST_F(AgnocastOnlySingleThreadedExecutorTest, test_spin_node_once_executes_only_one_ready_callback)
+{
+  // Arrange
+  agnocast::AgnocastOnlySingleThreadedExecutor executor;
+
+  std::atomic<int> callback_count{0};
+
+  [[maybe_unused]] auto timer1 =
+    this->node->create_wall_timer(1ms, [&]() { callback_count.fetch_add(1); });
+
+  [[maybe_unused]] auto timer2 =
+    this->node->create_wall_timer(1ms, [&]() { callback_count.fetch_add(1); });
+
+  std::this_thread::sleep_for(10ms);
+
+  // Act
+  executor.spin_node_once(this->node, 100ms);
+
+  // Assert
+  EXPECT_EQ(1, callback_count.load());
+  EXPECT_FALSE(executor.is_spinning());
+  expect_node_is_detached(executor, this->node);
+
+  // Cleanup
+  executor.cancel();
+}
+
+TEST_F(AgnocastOnlySingleThreadedExecutorTest, test_spin_node_once_throws_if_already_spinning)
+{
+  // Arrange
+  agnocast::AgnocastOnlySingleThreadedExecutor executor;
+
+  auto spinning_node = std::make_shared<agnocast::Node>(
+    "spinning_node",
+    "AgnocastOnlySingleThreadedExecutorTest_test_spin_node_once_throws_if_already_spinning");
+
+  executor.add_node(spinning_node);
+
+  std::thread spinner([&]() { executor.spin(); });
+
+  EXPECT_TRUE(wait_until([&]() { return executor.is_spinning(); }, 10s));
+
+  // Act / Assert
+  EXPECT_THROW(executor.spin_node_once(this->node, 0ns), std::runtime_error);
+
+  // Cleanup
+  executor.cancel();
+  spinner.join();
+  executor.remove_node(spinning_node, true);
+}
+
+TEST_F(AgnocastOnlySingleThreadedExecutorTest, test_spin_node_once_sets_is_spinning)
+{
+  // Arrange
+  agnocast::AgnocastOnlySingleThreadedExecutor executor;
+
+  std::atomic<bool> callback_started{false};
+  std::atomic<bool> allow_callback_return{false};
+  std::atomic<bool> spin_node_once_returned{false};
+
+  agnocast::TimerBase::SharedPtr timer;
+
+  timer = this->node->create_wall_timer(1ms, [&]() {
+    callback_started.store(true);
+    timer->cancel();
+
+    while (!allow_callback_return.load()) {
+      std::this_thread::sleep_for(1ms);
+    }
+  });
+
+  std::this_thread::sleep_for(10ms);
+
+  std::thread spinner([&]() {
+    executor.spin_node_once(this->node, 1s);
+    spin_node_once_returned.store(true);
+  });
+
+  // Act
+  const bool became_spinning =
+    wait_until([&]() { return callback_started.load() && executor.is_spinning(); }, 10s);
+
+  // Assert
+  EXPECT_TRUE(became_spinning);
+  EXPECT_FALSE(spin_node_once_returned.load());
+
+  // Cleanup
+  allow_callback_return.store(true);
+  spinner.join();
+
+  EXPECT_TRUE(spin_node_once_returned.load());
+  EXPECT_FALSE(executor.is_spinning());
+  expect_node_is_detached(executor, this->node);
+
+  executor.cancel();
+}
+
+TEST_F(AgnocastOnlySingleThreadedExecutorTest, test_spin_node_some)
+{
+  // Arrange
+  agnocast::AgnocastOnlySingleThreadedExecutor executor;
+
+  std::atomic<bool> timer_completed{false};
+  [[maybe_unused]] auto timer =
+    this->node->create_wall_timer(1ms, [&]() { timer_completed.store(true); });
+
+  std::this_thread::sleep_for(10ms);
+
+  // Act
+  executor.spin_node_some(this->node);
+
+  // Assert
+  EXPECT_TRUE(timer_completed.load());
+  EXPECT_FALSE(executor.is_spinning());
+  expect_node_is_detached(executor, this->node);
+
+  // Cleanup
+  executor.cancel();
+}
+
+TEST_F(
+  AgnocastOnlySingleThreadedExecutorTest,
+  test_spin_node_some_with_no_ready_callback_returns_immediately)
+{
+  // Arrange
+  agnocast::AgnocastOnlySingleThreadedExecutor executor;
+
+  // Act
+  const auto elapsed = measure_elapsed_time([&]() { executor.spin_node_some(this->node); });
+
+  // Assert
+  EXPECT_LT(elapsed, 100ms);
+  EXPECT_FALSE(executor.is_spinning());
+  expect_node_is_detached(executor, this->node);
+}
+
+TEST_F(AgnocastOnlySingleThreadedExecutorTest, test_spin_node_some_executes_ready_callback)
+{
+  // Arrange
+  agnocast::AgnocastOnlySingleThreadedExecutor executor;
+
+  std::atomic<int> callback_count{0};
+
+  [[maybe_unused]] auto timer =
+    this->node->create_wall_timer(1ms, [&]() { callback_count.fetch_add(1); });
+
+  std::this_thread::sleep_for(10ms);
+
+  // Act
+  executor.spin_node_some(this->node);
+
+  // Assert
+  EXPECT_GE(callback_count.load(), 1);
+  EXPECT_FALSE(executor.is_spinning());
+  expect_node_is_detached(executor, this->node);
+
+  // Cleanup
+  executor.cancel();
+}
+
+TEST_F(AgnocastOnlySingleThreadedExecutorTest, test_spin_node_some_throws_if_already_spinning)
+{
+  // Arrange
+  agnocast::AgnocastOnlySingleThreadedExecutor executor;
+
+  auto spinning_node = std::make_shared<agnocast::Node>(
+    "spinning_node",
+    "AgnocastOnlySingleThreadedExecutorTest_test_spin_node_some_throws_if_already_spinning");
+
+  executor.add_node(spinning_node);
+
+  std::thread spinner([&]() { executor.spin(); });
+
+  EXPECT_TRUE(wait_until([&]() { return executor.is_spinning(); }, 10s));
+
+  // Act / Assert
+  EXPECT_THROW(executor.spin_node_some(this->node), std::runtime_error);
+
+  // Cleanup
+  executor.cancel();
+  spinner.join();
+  executor.remove_node(spinning_node, true);
+}
+
+TEST_F(AgnocastOnlySingleThreadedExecutorTest, test_spin_node_some_sets_is_spinning)
+{
+  // Arrange
+  agnocast::AgnocastOnlySingleThreadedExecutor executor;
+
+  std::atomic<bool> callback_started{false};
+  std::atomic<bool> allow_callback_return{false};
+  std::atomic<bool> spin_node_some_returned{false};
+
+  agnocast::TimerBase::SharedPtr timer;
+
+  timer = this->node->create_wall_timer(1ms, [&]() {
+    callback_started.store(true);
+    timer->cancel();
+
+    while (!allow_callback_return.load()) {
+      std::this_thread::sleep_for(1ms);
+    }
+  });
+
+  std::this_thread::sleep_for(10ms);
+
+  std::thread spinner([&]() {
+    executor.spin_node_some(this->node);
+    spin_node_some_returned.store(true);
+  });
+
+  // Act
+  const bool became_spinning =
+    wait_until([&]() { return callback_started.load() && executor.is_spinning(); }, 10s);
+
+  // Assert
+  EXPECT_TRUE(became_spinning);
+  EXPECT_FALSE(spin_node_some_returned.load());
+
+  // Cleanup
+  allow_callback_return.store(true);
+  spinner.join();
+
+  EXPECT_TRUE(spin_node_some_returned.load());
+  EXPECT_FALSE(executor.is_spinning());
+  expect_node_is_detached(executor, this->node);
+
+  executor.cancel();
+}
+
+TEST_F(AgnocastOnlySingleThreadedExecutorTest, test_spin_node_all)
+{
+  // Arrange
+  agnocast::AgnocastOnlySingleThreadedExecutor executor;
+
+  std::atomic<bool> timer_completed{false};
+  [[maybe_unused]] auto timer =
+    this->node->create_wall_timer(1ms, [&]() { timer_completed.store(true); });
+
+  std::this_thread::sleep_for(10ms);
+
+  // Act
+  executor.spin_node_all(this->node, 1s);
+
+  // Assert
+  EXPECT_TRUE(timer_completed.load());
+  EXPECT_FALSE(executor.is_spinning());
+  expect_node_is_detached(executor, this->node);
+
+  // Cleanup
+  executor.cancel();
+}
+
+TEST_F(
+  AgnocastOnlySingleThreadedExecutorTest,
+  test_spin_node_all_with_zero_max_duration_returns_immediately)
+{
+  // Arrange
+  agnocast::AgnocastOnlySingleThreadedExecutor executor;
+
+  // Act
+  const auto elapsed = measure_elapsed_time([&]() { executor.spin_node_all(this->node, 0ns); });
+
+  // Assert
+  EXPECT_LT(elapsed, 100ms);
+  EXPECT_FALSE(executor.is_spinning());
+  expect_node_is_detached(executor, this->node);
+}
+
+TEST_F(AgnocastOnlySingleThreadedExecutorTest, test_spin_node_all_does_not_wait_until_max_duration)
+{
+  // Arrange
+  agnocast::AgnocastOnlySingleThreadedExecutor executor;
+
+  // Act
+  const auto elapsed = measure_elapsed_time([&]() { executor.spin_node_all(this->node, 100ms); });
+
+  // Assert
+  EXPECT_LT(elapsed, 100ms);
+  EXPECT_FALSE(executor.is_spinning());
+  expect_node_is_detached(executor, this->node);
+}
+
+TEST_F(
+  AgnocastOnlySingleThreadedExecutorTest,
+  test_spin_node_all_executes_callback_that_becomes_ready_while_spinning)
+{
+  // Arrange
+  agnocast::AgnocastOnlySingleThreadedExecutor executor;
+
+  std::atomic<int> first_callback_count{0};
+  std::atomic<int> second_callback_count{0};
+
+  agnocast::TimerBase::SharedPtr first_timer;
+  agnocast::TimerBase::SharedPtr second_timer;
+
+  first_timer = this->node->create_wall_timer(1ms, [&]() {
+    first_callback_count.fetch_add(1);
+    first_timer->cancel();
+
+    // Make the second timer become ready after the initial non-blocking wait.
+    std::this_thread::sleep_for(50ms);
+  });
+
+  second_timer = this->node->create_wall_timer(30ms, [&]() {
+    second_callback_count.fetch_add(1);
+    second_timer->cancel();
+  });
+
+  // Make only the first timer ready before spin_node_all starts.
+  std::this_thread::sleep_for(10ms);
+
+  // Act
+  executor.spin_node_all(this->node, 1s);
+
+  // Assert
+  EXPECT_EQ(1, first_callback_count.load());
+  EXPECT_EQ(1, second_callback_count.load());
+  EXPECT_FALSE(executor.is_spinning());
+  expect_node_is_detached(executor, this->node);
+
+  // Cleanup
+  executor.cancel();
+}
+
+TEST_F(AgnocastOnlySingleThreadedExecutorTest, test_spin_node_all_respects_max_duration)
+{
+  // Arrange
+  agnocast::AgnocastOnlySingleThreadedExecutor executor;
+
+  std::atomic<int> callback_count{0};
+
+  [[maybe_unused]] auto timer = this->node->create_wall_timer(1ms, [&]() {
+    callback_count.fetch_add(1);
+    std::this_thread::sleep_for(2ms);
+  });
+
+  std::this_thread::sleep_for(10ms);
+
+  // Act
+  const auto elapsed = measure_elapsed_time([&]() { executor.spin_node_all(this->node, 100ms); });
+
+  // Assert
+  EXPECT_GE(elapsed, 90ms);
+  EXPECT_LT(elapsed, 1s);
+  EXPECT_GT(callback_count.load(), 1);
+  EXPECT_FALSE(executor.is_spinning());
+  expect_node_is_detached(executor, this->node);
+
+  // Cleanup
+  executor.cancel();
+}
+
+TEST_F(AgnocastOnlySingleThreadedExecutorTest, test_spin_node_all_throws_if_already_spinning)
+{
+  // Arrange
+  agnocast::AgnocastOnlySingleThreadedExecutor executor;
+
+  auto spinning_node = std::make_shared<agnocast::Node>(
+    "spinning_node",
+    "AgnocastOnlySingleThreadedExecutorTest_test_spin_node_all_throws_if_already_spinning");
+
+  executor.add_node(spinning_node);
+
+  std::thread spinner([&]() { executor.spin(); });
+
+  EXPECT_TRUE(wait_until([&]() { return executor.is_spinning(); }, 10s));
+
+  // Act / Assert
+  EXPECT_THROW(executor.spin_node_all(this->node, 0ns), std::runtime_error);
+
+  // Cleanup
+  executor.cancel();
+  spinner.join();
+  executor.remove_node(spinning_node, true);
+}
+
+TEST_F(AgnocastOnlySingleThreadedExecutorTest, test_spin_node_all_sets_is_spinning)
+{
+  // Arrange
+  agnocast::AgnocastOnlySingleThreadedExecutor executor;
+
+  std::atomic<bool> callback_started{false};
+  std::atomic<bool> allow_callback_return{false};
+  std::atomic<bool> spin_node_all_returned{false};
+
+  agnocast::TimerBase::SharedPtr timer;
+
+  timer = this->node->create_wall_timer(1ms, [&]() {
+    callback_started.store(true);
+    timer->cancel();
+
+    while (!allow_callback_return.load()) {
+      std::this_thread::sleep_for(1ms);
+    }
+  });
+
+  std::this_thread::sleep_for(10ms);
+
+  std::thread spinner([&]() {
+    executor.spin_node_all(this->node, 1s);
+    spin_node_all_returned.store(true);
+  });
+
+  // Act
+  const bool became_spinning =
+    wait_until([&]() { return callback_started.load() && executor.is_spinning(); }, 10s);
+
+  // Assert
+  EXPECT_TRUE(became_spinning);
+  EXPECT_FALSE(spin_node_all_returned.load());
+
+  // Cleanup
+  allow_callback_return.store(true);
+  spinner.join();
+
+  EXPECT_TRUE(spin_node_all_returned.load());
+  EXPECT_FALSE(executor.is_spinning());
+  expect_node_is_detached(executor, this->node);
+
+  executor.cancel();
 }

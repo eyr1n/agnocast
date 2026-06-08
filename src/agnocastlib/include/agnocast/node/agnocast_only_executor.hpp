@@ -75,6 +75,9 @@ protected:
 
   void add_callback_groups_from_nodes_associated_to_executor();
 
+  void spin_node_once_nanoseconds(
+    const rclcpp::node_interfaces::NodeBaseInterface::SharedPtr & node,
+    std::chrono::nanoseconds timeout);
   virtual rclcpp::FutureReturnCode spin_until_future_complete_impl(
     std::chrono::nanoseconds timeout,
     const std::function<std::future_status(std::chrono::nanoseconds wait_time)> & wait_for_future);
@@ -155,10 +158,56 @@ public:
   AGNOCAST_PUBLIC
   void remove_node(const std::shared_ptr<agnocast::Node> & node, bool notify = true);
 
+  /// Add a node to executor, execute the next available unit of work, and remove the node.
+  /// @param node Shared pointer to the node to add.
+  /// @param timeout How long to wait for work to become available. Negative values cause
+  /// spin_node_once to block indefinitely (the default behavior). A timeout of 0 causes this
+  /// function to be non-blocking.
+  template <typename RepT = int64_t, typename T = std::milli>
+  void spin_node_once(
+    const rclcpp::node_interfaces::NodeBaseInterface::SharedPtr & node,
+    std::chrono::duration<RepT, T> timeout = std::chrono::duration<RepT, T>(-1))
+  {
+    return spin_node_once_nanoseconds(
+      node, std::chrono::duration_cast<std::chrono::nanoseconds>(timeout));
+  }
+
+  /// Convenience function which takes Node and forwards NodeBaseInterface.
+  template <typename NodeT = agnocast::Node, typename RepT = int64_t, typename T = std::milli>
+  void spin_node_once(
+    const std::shared_ptr<NodeT> & node,
+    std::chrono::duration<RepT, T> timeout = std::chrono::duration<RepT, T>(-1))
+  {
+    return spin_node_once_nanoseconds(
+      node->get_node_base_interface(),
+      std::chrono::duration_cast<std::chrono::nanoseconds>(timeout));
+  }
+
+  /// Add a node, complete all immediately available work, and remove the node.
+  /// @param node Shared pointer to the node to add.
+  AGNOCAST_PUBLIC
+  virtual void spin_node_some(const rclcpp::node_interfaces::NodeBaseInterface::SharedPtr & node);
+
+  /// Convenience function which takes Node and forwards NodeBaseInterface.
+  AGNOCAST_PUBLIC
+  virtual void spin_node_some(const std::shared_ptr<agnocast::Node> & node);
+
   /// Collect work once and execute all available work, optionally within a max duration.
   /// @param max_duration The maximum amount of time to spend executing work, or 0 for no limit.
   AGNOCAST_PUBLIC
   virtual void spin_some(std::chrono::nanoseconds max_duration = std::chrono::nanoseconds(0));
+
+  /// Add a node, complete all immediately available work exhaustively, and remove the node.
+  /// @param node Shared pointer to the node to add.
+  AGNOCAST_PUBLIC
+  virtual void spin_node_all(
+    const rclcpp::node_interfaces::NodeBaseInterface::SharedPtr & node,
+    std::chrono::nanoseconds max_duration);
+
+  /// Convenience function which takes Node and forwards NodeBaseInterface.
+  AGNOCAST_PUBLIC
+  virtual void spin_node_all(
+    const std::shared_ptr<agnocast::Node> & node, std::chrono::nanoseconds max_duration);
 
   /// Collect and execute work repeatedly within a duration or until no more work is available.
   /// @param max_duration The maximum amount of time to spend executing work, must be >= 0. `0` is

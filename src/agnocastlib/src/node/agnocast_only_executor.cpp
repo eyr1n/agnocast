@@ -393,6 +393,15 @@ void AgnocastOnlyExecutor::remove_node(const std::shared_ptr<agnocast::Node> & n
   remove_node(node->get_node_base_interface(), notify);
 }
 
+void AgnocastOnlyExecutor::spin_node_once_nanoseconds(
+  const rclcpp::node_interfaces::NodeBaseInterface::SharedPtr & node,
+  std::chrono::nanoseconds timeout)
+{
+  this->add_node(node, false);
+  spin_once(timeout);
+  this->remove_node(node, false);
+}
+
 rclcpp::FutureReturnCode AgnocastOnlyExecutor::spin_until_future_complete_impl(
   std::chrono::nanoseconds timeout,
   const std::function<std::future_status(std::chrono::nanoseconds wait_time)> & wait_for_future)
@@ -440,9 +449,37 @@ rclcpp::FutureReturnCode AgnocastOnlyExecutor::spin_until_future_complete_impl(
   return rclcpp::FutureReturnCode::INTERRUPTED;
 }
 
+void AgnocastOnlyExecutor::spin_node_some(
+  const rclcpp::node_interfaces::NodeBaseInterface::SharedPtr & node)
+{
+  this->add_node(node, false);
+  spin_some();
+  this->remove_node(node, false);
+}
+
+void AgnocastOnlyExecutor::spin_node_some(const std::shared_ptr<agnocast::Node> & node)
+{
+  this->spin_node_some(node->get_node_base_interface());
+}
+
 void AgnocastOnlyExecutor::spin_some(std::chrono::nanoseconds max_duration)
 {
   return this->spin_some_impl(max_duration, false);
+}
+
+void AgnocastOnlyExecutor::spin_node_all(
+  const rclcpp::node_interfaces::NodeBaseInterface::SharedPtr & node,
+  std::chrono::nanoseconds max_duration)
+{
+  this->add_node(node, false);
+  spin_all(max_duration);
+  this->remove_node(node, false);
+}
+
+void AgnocastOnlyExecutor::spin_node_all(
+  const std::shared_ptr<agnocast::Node> & node, std::chrono::nanoseconds max_duration)
+{
+  this->spin_node_all(node->get_node_base_interface(), max_duration);
 }
 
 void AgnocastOnlyExecutor::spin_all(std::chrono::nanoseconds max_duration)
